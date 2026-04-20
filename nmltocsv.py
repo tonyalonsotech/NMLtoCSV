@@ -6,22 +6,28 @@ from urllib.parse import unquote
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-# Version Notes:
-# Version 1.1
-# Added Drag and Drop Support.
+# ----------------
+# Version History
+# ----------------
 #
-# Version 1.2
-# Adjusted some UI text elements to eliminate redundancies.
+# v1.0 - Initial release
+# - Converts NML to CSV
 #
-# Version 1.3
-# Decoupled column button selection order from default column order.
+# v1.1
+# - Added drag-and-drop support
 #
-# Version 1.4
-# Cleaned up UX by replacing checkboxes with tiled buttons.
+# v1.2
+# - Refined UI text to reduce redundancy
 #
-# Version 1.5
-# Added preference auto saving and loading.
-# The preferences JSON file is written to the %APPDATA% folder. 
+# v1.3
+# - Decoupled column selection order from default column order
+#
+# v1.4
+# - Replaced checkboxes with tile-based selection UI
+#
+# v1.5 - Current Version
+# - Added automatic preference saving and loading
+# - Preferences are stored in the Windows %APPDATA% directory as nmltocsv_preferences.json 
 
 
 # Drag and drop support
