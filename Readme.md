@@ -35,7 +35,7 @@ v1.3
 v1.4
 - Replaced checkboxes with tile-based selection UI
 
-v1.5 - Current Version
+v1.5
 - Added automatic preference saving and loading
 - Preferences are stored in the Windows %APPDATA% directory as nmltocsv_preferences.json
 
