@@ -38,3 +38,7 @@ v1.4
 v1.5 - Current Version
 - Added automatic preference saving and loading
 - Preferences are stored in the Windows %APPDATA% directory as nmltocsv_preferences.json
+
+v1.6 - Current version
+- Added artwork export from embedded track metadata (Artwork is saved in same folder as music file)
+-- Includes Artwork File Location CSV support and manual artwork add/overwrite workflow for missing artwork
