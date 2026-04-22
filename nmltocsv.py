@@ -5,6 +5,13 @@ import xml.etree.ElementTree as ET
 from urllib.parse import unquote
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import shutil
+from pathlib import Path
+from mutagen import File as MutagenFile
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3
+from mutagen.mp4 import MP4
+
 
 # ----------------
 # Version History
@@ -25,9 +32,13 @@ from tkinter import filedialog, messagebox
 # v1.4
 # - Replaced checkboxes with tile-based selection UI
 #
-# v1.5 - Current Version
+# v1.5
 # - Added automatic preference saving and loading
-# - Preferences are stored in the Windows %APPDATA% directory as nmltocsv_preferences.json 
+# - Preferences are stored in the Windows %APPDATA% directory as nmltocsv_preferences.json
+#
+# v1.6 - Current version
+# - Added artwork export from embedded track metadata
+# -- Includes Artwork File Location CSV support and manual artwork add/overwrite workflow for missing artwork
 
 
 # Drag and drop support
@@ -266,6 +277,144 @@ def write_csv(rows, output_csv, selected_columns):
             filtered_row = {col: row.get(col, "") for col in selected_columns}
             writer.writerow(filtered_row)
 
+# Artwork Extraction
+def get_artwork_extension(mime_type, fallback=".jpg"):
+    if not mime_type:
+        return fallback
+
+    mime_type = mime_type.lower().strip()
+
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tif",
+    }
+
+    return mapping.get(mime_type, fallback)
+
+
+def get_track_artwork_basepath(track_file_path):
+    track_path = Path(track_file_path)
+    return track_path.with_suffix("")
+
+
+def find_existing_artwork_for_track(track_file_path):
+    base = get_track_artwork_basepath(track_file_path)
+    possible_exts = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]
+
+    for ext in possible_exts:
+        candidate = Path(str(base) + ext)
+        if candidate.exists():
+            return str(candidate)
+
+    return ""
+
+
+def extract_embedded_artwork(track_file_path):
+    """
+    Returns:
+        (image_bytes, extension) on success
+        (None, None) if no embedded artwork found
+    """
+    try:
+        audio = MutagenFile(track_file_path)
+        if audio is None:
+            return None, None
+
+        # MP3 / AIFF / WAV with ID3 APIC
+        if hasattr(audio, "tags") and audio.tags:
+            # ID3-based tags
+            if hasattr(audio.tags, "getall"):
+                apic_frames = audio.tags.getall("APIC")
+                if apic_frames:
+                    apic = apic_frames[0]
+                    ext = get_artwork_extension(getattr(apic, "mime", ""), ".jpg")
+                    return apic.data, ext
+
+            # MP4 / M4A cover atoms
+            if "covr" in audio.tags:
+                covr = audio.tags["covr"]
+                if covr:
+                    cover = covr[0]
+                    # MP4 cover format detection by bytes
+                    data = bytes(cover)
+                    if data.startswith(b"\x89PNG"):
+                        return data, ".png"
+                    return data, ".jpg"
+
+        # FLAC pictures
+        if isinstance(audio, FLAC) and getattr(audio, "pictures", None):
+            pic = audio.pictures[0]
+            ext = get_artwork_extension(getattr(pic, "mime", ""), ".jpg")
+            return pic.data, ext
+
+    except Exception:
+        return None, None
+
+    return None, None
+
+
+def save_embedded_artwork(track_file_path, overwrite=False):
+    """
+    Saves embedded artwork next to the audio file using the track filename.
+    Returns:
+        {
+            "artwork_path": str,
+            "status": str
+        }
+    """
+    existing = find_existing_artwork_for_track(track_file_path)
+    if existing and not overwrite:
+        return {
+            "artwork_path": existing,
+            "status": "existing_artwork_found"
+        }
+
+    image_bytes, ext = extract_embedded_artwork(track_file_path)
+    if not image_bytes or not ext:
+        return {
+            "artwork_path": existing if existing else "",
+            "status": "missing_embedded_artwork"
+        }
+
+    base = get_track_artwork_basepath(track_file_path)
+    output_path = Path(str(base) + ext)
+
+    try:
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
+
+        return {
+            "artwork_path": str(output_path),
+            "status": "artwork_extracted"
+        }
+    except Exception:
+        return {
+            "artwork_path": "",
+            "status": "artwork_save_failed"
+        }
+
+
+def copy_manual_artwork_to_track(track_file_path, chosen_artwork_path, overwrite=False):
+    existing = find_existing_artwork_for_track(track_file_path)
+    chosen_path = Path(chosen_artwork_path)
+    ext = chosen_path.suffix.lower()
+
+    if not ext:
+        ext = ".jpg"
+
+    output_path = Path(str(get_track_artwork_basepath(track_file_path)) + ext)
+
+    if output_path.exists() and not overwrite:
+        return str(output_path)
+
+    shutil.copy2(chosen_artwork_path, output_path)
+    return str(output_path)
+
 
 # UI
 class TraktorExporterApp:
@@ -310,9 +459,18 @@ class TraktorExporterApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("NML to CSV Converter")
-        self.root.geometry("900x745")
-        self.root.minsize(900, 745)
+        self.root.overrideredirect(True)
+        self.root.title("NML to CSV")
+        self.root.geometry("900x775")
+        self.root.minsize(900, 775)
+
+        #Artwork Export
+        self.export_artwork = tk.BooleanVar(value=False)
+        self.missing_artwork_items = []
+
+        self.last_export_rows = []
+        self.last_export_columns = []
+        self.last_export_output_file = ""
 
         self.colors = {
             "bg": "#1b1026",
@@ -426,6 +584,9 @@ class TraktorExporterApp:
             if isinstance(saved_output, str) and saved_output.strip():
                 self.output_path.set(saved_output.strip())
 
+            saved_export_artwork = prefs.get("export_artwork", False)
+            self.export_artwork.set(bool(saved_export_artwork))
+
         except Exception:
             pass
 
@@ -435,6 +596,7 @@ class TraktorExporterApp:
                 "selected_columns": [col for col in self.available_columns if self.column_vars[col].get()],
                 "column_order": list(self.selected_listbox.get(0, tk.END)) if hasattr(self, "selected_listbox") else self.saved_column_order,
                 "last_output_path": self.output_path.get().strip(),
+                "export_artwork": self.export_artwork.get(),
             }
 
             with open(self.preferences_file, "w", encoding="utf-8") as f:
@@ -506,6 +668,7 @@ class TraktorExporterApp:
         )
 
     def build_ui(self):
+        self.build_title_bar(self.root)
         outer = tk.Frame(self.root, bg=self.colors["bg"])
         outer.pack(fill="both", expand=True, padx=18, pady=18)
         self.outer_frame = outer
@@ -572,13 +735,34 @@ class TraktorExporterApp:
 
         self.make_button(target_row, "Change", self.browse_output, width=12).grid(row=0, column=1)
 
+        drag_row = tk.Frame(content, bg=self.colors["panel"])
+        drag_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+
+        drag_row.grid_columnconfigure(0, weight=1)
+
+        # Left side text
         self.make_label(
-            content,
+            drag_row,
             "Drag & drop your .nml file anywhere.",
             size=9,
             bold=True,
             color=self.colors["muted"]
-        ).grid(row=4, column=0, columnspan=2, pady=(16, 0), sticky="w")
+        ).grid(row=0, column=0, sticky="w")
+
+        # Right side checkbox
+        artwork_cb = tk.Checkbutton(
+            drag_row,
+            text="Export Artwork",
+            variable=self.export_artwork,
+            command=self.save_preferences,
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            activebackground=self.colors["panel"],
+            activeforeground=self.colors["text"],
+            selectcolor=self.colors["entry"],
+            font=("Segoe UI", 10),
+        )
+        artwork_cb.grid(row=0, column=1, sticky="e", padx=(0, 6))
 
         if not DND_AVAILABLE:
             self.make_label(
@@ -586,9 +770,10 @@ class TraktorExporterApp:
                 "Drag-and-drop support is unavailable until tkinterdnd2 is installed.",
                 size=9,
                 color=self.colors["muted"]
-            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         content.grid_columnconfigure(0, weight=1)
+
 
     def build_columns_section(self, parent):
         top = tk.Frame(parent, bg=self.colors["panel"])
@@ -923,6 +1108,9 @@ class TraktorExporterApp:
         output_file = self.output_path.get().strip()
         selected_columns = self.get_selected_columns()
 
+        if self.export_artwork.get() and "Artwork File Location" not in selected_columns:
+            selected_columns.append("Artwork File Location")
+
         if not input_file:
             messagebox.showerror("Missing Input", "Please select an NML file.")
             return
@@ -945,18 +1133,306 @@ class TraktorExporterApp:
 
             rows = extract_entries(input_file)
 
+            self.missing_artwork_items = []
+
+            if self.export_artwork.get():
+                self.status_text.set("Extracting artwork...")
+                self.root.update_idletasks()
+
+                for row in rows:
+                    track_path = row.get("File Location", "").strip()
+                    artwork_path = ""
+
+                    if track_path and os.path.isfile(track_path):
+                        result = save_embedded_artwork(track_path, overwrite=False)
+                        artwork_path = result.get("artwork_path", "")
+                        status = result.get("status", "")
+
+                        row["Artwork File Location"] = artwork_path
+
+                        if status in ("missing_embedded_artwork", "artwork_save_failed"):
+                            existing_art = find_existing_artwork_for_track(track_path)
+                            self.missing_artwork_items.append({
+                                "artist": row.get("Artist", ""),
+                                "title": row.get("Track Title", ""),
+                                "track_path": track_path,
+                                "existing_artwork": existing_art,
+                                "csv_row": row,
+                            })
+                    else:
+                        row["Artwork File Location"] = ""
+                        self.missing_artwork_items.append({
+                            "artist": row.get("Artist", ""),
+                            "title": row.get("Track Title", ""),
+                            "track_path": track_path,
+                            "existing_artwork": "",
+                            "csv_row": row,
+                        })
+
             self.status_text.set("Writing CSV...")
             self.root.update_idletasks()
 
             write_csv(rows, output_file, selected_columns)
+            self.last_export_rows = rows
+            self.last_export_columns = selected_columns.copy()
+            self.last_export_output_file = output_file
             self.save_preferences()
 
             self.status_text.set(f"Done. Exported {len(rows)} entries to: {output_file}")
             messagebox.showinfo("Export Complete", f"Exported {len(rows)} entries successfully.")
+
+            if self.export_artwork.get() and self.missing_artwork_items:
+                self.open_missing_artwork_window()
+
         except Exception as e:
             self.status_text.set("Export failed.")
             messagebox.showerror("Error", f"Failed to export CSV:\n\n{e}")
 
+    def refresh_missing_artwork_list(self, list_container):
+        for widget in list_container.winfo_children():
+            widget.destroy()
+
+        for item in self.missing_artwork_items:
+            row_frame = tk.Frame(
+                list_container,
+                bg=self.colors["panel_alt"],
+                highlightthickness=1,
+                highlightbackground=self.colors["border"],
+                padx=8,
+                pady=8
+            )
+            row_frame.pack(fill="x", pady=4)
+
+            title_text = (
+                f'{item["artist"]} - {item["title"]}'
+                if item["artist"] or item["title"]
+                else item["track_path"]
+            )
+
+            info = tk.Label(
+                row_frame,
+                text=title_text,
+                bg=self.colors["panel_alt"],
+                fg=self.colors["text"],
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 10, "bold")
+            )
+            info.pack(anchor="w")
+
+            path_label = tk.Label(
+                row_frame,
+                text=item["track_path"],
+                bg=self.colors["panel_alt"],
+                fg=self.colors["muted"],
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 9)
+            )
+            path_label.pack(anchor="w", pady=(2, 6))
+
+            button_row = tk.Frame(row_frame, bg=self.colors["panel_alt"])
+            button_row.pack(anchor="w")
+
+            has_existing = bool(item.get("existing_artwork"))
+            add_text = "Overwrite" if has_existing else "Add Artwork"
+
+            tk.Button(
+                button_row,
+                text=add_text,
+                command=lambda i=item: self.handle_manual_artwork(i),
+                relief="flat",
+                bd=0,
+                bg=self.colors["accent"],
+                fg=self.colors["text"],
+                activebackground=self.colors["accent_hover"],
+                activeforeground=self.colors["text"],
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            ).pack(side="left", padx=(0, 8))
+
+            tk.Button(
+                button_row,
+                text="Ignore",
+                command=lambda i=item, rf=row_frame: self.ignore_missing_artwork(i, rf),
+                relief="flat",
+                bd=0,
+                bg=self.colors["panel"],
+                fg=self.colors["text"],
+                activebackground=self.colors["panel_alt"],
+                activeforeground=self.colors["text"],
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            ).pack(side="left")
+
+    def ignore_missing_artwork(self, item, row_frame):
+        if item in self.missing_artwork_items:
+            self.missing_artwork_items.remove(item)
+        row_frame.destroy()
+
+    def handle_manual_artwork(self, item):
+        chosen_file = filedialog.askopenfilename(
+            title="Select Artwork File",
+            filetypes=[
+                ("Image Files", "*.jpg *.jpeg *.png *.webp *.gif *.bmp *.tif *.tiff"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not chosen_file:
+            return
+
+        try:
+            overwrite = bool(item.get("existing_artwork"))
+            new_art_path = copy_manual_artwork_to_track(
+                item["track_path"],
+                chosen_file,
+                overwrite=overwrite
+            )
+
+            item["csv_row"]["Artwork File Location"] = new_art_path
+            item["existing_artwork"] = new_art_path
+
+            self.rewrite_last_export_csv()
+
+            if item in self.missing_artwork_items:
+                self.missing_artwork_items.remove(item)
+
+            if hasattr(self, "missing_artwork_list_container"):
+                self.refresh_missing_artwork_list(self.missing_artwork_list_container)
+
+            track_name = f'{item.get("artist","")} - {item.get("title","")}'.strip(" -")
+            self.show_temp_status(f"Artwork added for: {track_name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add artwork:\n\n{e}")
+
+
+    def open_missing_artwork_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("Missing Artwork Review")
+        win.geometry("850x500")
+        win.configure(bg=self.colors["bg"])
+
+        header = tk.Label(
+            win,
+            text="Tracks with Missing Artwork",
+            bg=self.colors["bg"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 14, "bold"),
+            anchor="w"
+        )
+        header.pack(fill="x", padx=14, pady=(14, 6))
+
+        sub = tk.Label(
+            win,
+            text="Add or overwrite artwork for tracks that were missing embedded art during export.",
+            bg=self.colors["bg"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left"
+        )
+        sub.pack(fill="x", padx=14, pady=(0, 10))
+
+        outer = tk.Frame(
+            win,
+            bg=self.colors["panel"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border"]
+        )
+        outer.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        canvas = tk.Canvas(outer, bg=self.colors["panel"], highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=self.colors["panel"])
+        self.missing_artwork_list_container = inner
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.refresh_missing_artwork_list(inner)
+
+    def rewrite_last_export_csv(self):
+        if not self.last_export_rows or not self.last_export_columns or not self.last_export_output_file:
+            return
+
+        write_csv(
+            self.last_export_rows,
+            self.last_export_output_file,
+            self.last_export_columns
+        )
+
+    def start_move(self, event):
+        self._x = event.x
+        self._y = event.y
+
+    def on_move(self, event):
+        x = self.root.winfo_pointerx() - self._x
+        y = self.root.winfo_pointery() - self._y
+        self.root.geometry(f"+{x}+{y}")
+
+    # Title Bar
+    def build_title_bar(self, parent):
+        title_bar = tk.Frame(parent, bg=self.colors["panel_alt"], height=36)
+        title_bar.pack(fill="x", side="top")
+
+        # Window drag support
+        title_bar.bind("<Button-1>", self.start_move)
+        title_bar.bind("<B1-Motion>", self.on_move)
+
+        title_label = tk.Label(
+            title_bar,
+            text="NML to CSV Converter",
+            bg=self.colors["panel_alt"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 10, "bold")
+        )
+        title_label.pack(side="left", padx=10)
+
+        title_label.bind("<Button-1>", self.start_move)
+        title_label.bind("<B1-Motion>", self.on_move)
+
+        # Buttons
+        btn_frame = tk.Frame(title_bar, bg=self.colors["panel_alt"])
+        btn_frame.pack(side="right")
+
+        tk.Button(
+            btn_frame,
+            text="—",
+            command=self.minimize_window,
+            bg=self.colors["panel_alt"],
+            fg=self.colors["text"],
+            bd=0,
+            padx=10,
+            font=("Segoe UI", 10),
+            activebackground=self.colors["accent"]
+        ).pack(side="left")
+
+        tk.Button(
+            btn_frame,
+            text="✕",
+            command=self.root.destroy,
+            bg=self.colors["panel_alt"],
+            fg=self.colors["text"],
+            bd=0,
+            padx=10,
+            font=("Segoe UI", 10),
+            activebackground="#ff4d4d"
+        ).pack(side="left")
+
+        return title_bar
+
+    def minimize_window(self):
+        self.root.overrideredirect(False)
+        self.root.iconify()
+        self.root.after(10, lambda: self.root.overrideredirect(True))
 
 def create_root():
     if DND_AVAILABLE:
